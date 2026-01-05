@@ -1,6 +1,31 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { prisma } from '@/lib/prisma';
 import { generateEmbedding, productToText } from '@/lib/embeddings';
+const parseList = (value: any): string[] => {
+    // déjà un tableau -> on renvoie tel quel
+    if (Array.isArray(value)) {
+        return value.map(v => String(v).trim()).filter(Boolean);
+    }
+
+    // null / undefined -> tableau vide
+    if (!value) return [];
+
+    // nombre -> converti en string
+    if (typeof value === "number") {
+        return [String(value)];
+    }
+
+    // string classique "a,b,c"
+    if (typeof value === "string") {
+        return value
+            .split(",")
+            .map(v => v.trim())
+            .filter(Boolean);
+    }
+
+    // fallback sécurité
+    return [];
+};
 
 export async function POST(request: NextRequest) {
     try {
@@ -13,17 +38,17 @@ export async function POST(request: NextRequest) {
             data: {
                 name: productData.name,
                 type: productData.type,
-                price: parseFloat(productData.price),
-                minQty: parseInt(productData.minQty),
-                maxQty: parseInt(productData.maxQty),
-                leadTime: parseInt(productData.leadTime),
+                price: Number(productData.price),
+                minQty: Number(productData.minQty),
+                maxQty: Number(productData.maxQty),
+                leadTime: Number(productData.leadTime),
                 description: productData.description,
-                tags: productData.tags || [],
-                customization: productData.customization || [],
-                sizes: productData.sizes || [],
-                colors: productData.colors || [],
-                stockQuebec: parseInt(productData.stockQuebec) || 0,
-                stockMontreal: parseInt(productData.stockMontreal) || 0,
+                tags: parseList(productData.tags),
+                customization: parseList(productData.customization),
+                sizes: parseList(productData.sizes),
+                colors: parseList(productData.colors),
+                stockQuebec: Number(productData.stockQuebec ?? 0),
+                stockMontreal: Number(productData.stockMontreal ?? 0),
             },
         });
 
