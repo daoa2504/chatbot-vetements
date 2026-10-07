@@ -1,0 +1,29 @@
+# Supabase met en pause les projets gratuits après 7 jours sans activité.
+# Une requête quotidienne sur la base suffit à garder le projet actif.
+name: Supabase keepalive
+
+on:
+  schedule:
+    # Tous les jours à 9h UTC (5h à Montréal en été, 4h en hiver)
+    - cron: '0 9 * * *'
+  # Permet de lancer la tâche à la main depuis l'onglet Actions
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Interroger la base
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+        run: |
+          if [ -z "$DATABASE_URL" ]; then
+            echo "::error::Le secret DATABASE_URL n'est pas défini (Settings > Secrets and variables > Actions)"
+            exit 1
+          fi
+          # Une vraie requête sur une table compte comme activité pour Supabase
+          psql "$DATABASE_URL" --no-psqlrc --tuples-only --command 'SELECT count(*) AS produits FROM "Product";'
