@@ -1,4 +1,5 @@
 import {NextRequest, NextResponse} from 'next/server';
+import {Prisma} from '@prisma/client';
 import {groq} from '@/lib/groq';
 import {prisma} from '@/lib/prisma';
 import {generateEmbedding} from '@/lib/embeddings';
@@ -18,6 +19,21 @@ interface ParsedNeeds {
     autres_besoins?: string;
     show_all_options?: boolean;
 }
+
+interface HistoryMessage {
+    role: 'user' | 'assistant';
+    content: string;
+}
+
+const HISTORY_LIMIT = 10;
+const HISTORY_MESSAGE_MAX_CHARS = 1500;
+
+// llama-3.3-70b-versatile a été retiré par Groq. gpt-oss raisonne avant de répondre :
+// effort bas pour garder la latence, et max_tokens assez large pour raisonnement + réponse.
+const CHAT_MODEL = 'openai/gpt-oss-120b';
+
+const DEFAULT_QUANTITY = 25;
+const DEFAULT_BUDGET = 100;
 
 interface BudgetInfo {
     withinBudgetCount: number;
@@ -55,6 +71,18 @@ export async function POST(request: NextRequest) {
             });
         }
 
+        // Historique récent de la session (avant le message courant), pour que le bot
+        // se souvienne du type, de la quantité et du budget déjà donnés
+        const previousMessages = await prisma.chatMessage.findMany({
+            where: { sessionId: session.id },
+            orderBy: { createdAt: 'desc' },
+            take: HISTORY_LIMIT,
+        });
+        const history: HistoryMessage[] = previousMessages.reverse().map((m) => ({
+            role: m.role === 'assistant' ? 'assistant' : 'user',
+            content: m.content.slice(0, HISTORY_MESSAGE_MAX_CHARS),
+        }));
+
         // Sauvegarder le message utilisateur
         await prisma.chatMessage.create({
             data: {
@@ -66,17 +94,25 @@ export async function POST(request: NextRequest) {
         });
 
         // Étape 1 : Parser les besoins avec Groq
-        const parsedNeeds = await parseUserNeeds(message);
+        const parsedNeeds = await parseUserNeeds(message, history);
 
-        // Étape 2 : Chercher les produits correspondants (avec RAG vectoriel)
-        const { products: matchingProducts, budgetInfo } = await findMatchingProducts(parsedNeeds, message);
+        // Étape 2 : Chercher les produits correspondants (avec RAG vectoriel).
+        // Les messages précédents du client enrichissent la recherche : « oui, montre-les »
+        // seul ne dit rien sur le produit voulu.
+        const userConversation = [
+            ...history.filter((m) => m.role === 'user').map((m) => m.content),
+            message,
+        ].join('\n');
+        const { products: matchingProducts, budgetInfo } = await findMatchingProducts(parsedNeeds, userConversation);
 
         // Étape 3 : Générer une réponse personnalisée
         const aiResponse = await generateRecommendation(
             message,
             parsedNeeds,
             matchingProducts,
-            budgetInfo
+            budgetInfo,
+            history,
+            userConversation
         );
 
         // Sauvegarder la réponse de l'assistant
@@ -105,13 +141,24 @@ export async function POST(request: NextRequest) {
 }
 
 // Fonction 1 : Parser les besoins du client avec l'IA
-async function parseUserNeeds(message: string): Promise<ParsedNeeds> {
+async function parseUserNeeds(message: string, history: HistoryMessage[]): Promise<ParsedNeeds> {
+    const conversation = history
+        .map((m) => `${m.role === 'user' ? 'Client' : 'Conseiller'} : ${m.content}`)
+        .join('\n\n');
+
     const completion = await groq.chat.completions.create({
         messages: [
             {
                 role: 'system',
                 content: `Tu es un expert en extraction d'informations pour vêtements d'équipe.
-Extrait les besoins du client et réponds UNIQUEMENT en JSON valide (sans markdown, sans backticks) :
+Extrait les besoins du client à partir de TOUTE la conversation et réponds UNIQUEMENT en JSON valide (sans markdown, sans backticks).
+
+Les besoins s'accumulent au fil de la conversation : si le client a donné le type, la quantité,
+le budget ou le délai dans un message précédent, CONSERVE ces valeurs, sauf s'il les change
+explicitement dans son dernier message. N'utilise les valeurs par défaut que si l'information
+n'apparaît nulle part dans la conversation.
+
+Format :
 {
   "type_produit": "hoodie/tshirt/veste/polo/short/autre",
   "quantite": nombre (si mentionné, sinon 25 par défaut),
@@ -122,7 +169,11 @@ Extrait les besoins du client et réponds UNIQUEMENT en JSON valide (sans markdo
   "show_all_options": boolean (true si l'utilisateur veut voir TOUTES les options même hors budget)
 }
 
-Mets "show_all_options": true si l'utilisateur dit :
+Contrairement aux autres champs, "show_all_options" ne s'accumule PAS : il dépend UNIQUEMENT
+du dernier message. Une demande de voir toutes les options faite plus tôt dans la conversation
+ne compte plus.
+
+Mets "show_all_options": true si le DERNIER message dit :
 - "Oui je veux voir les autres"
 - "Montre-moi tout"
 - "Affiche les 11"
@@ -134,36 +185,64 @@ Exemples:
 - "On veut 25 hoodies pour notre équipe de soccer, budget 60$ chacun" 
   → {"type_produit":"hoodie","quantite":25,"budget_par_unite":60,"sport_ou_activite":"soccer","show_all_options":false}
   
-- "Oui je veux afficher les 11"
-  → {"type_produit":"autre","quantite":25,"budget_par_unite":100,"show_all_options":true}
-  
-- "Montre-moi toutes les options"
+- Conversation précédente : "On veut 25 hoodies pour notre équipe de soccer, budget 60$ chacun"
+  Dernier message : "Oui je veux afficher les 11"
+  → {"type_produit":"hoodie","quantite":25,"budget_par_unite":60,"sport_ou_activite":"soccer","show_all_options":true}
+
+- Conversation précédente : "Des t-shirts pour 40 personnes, max 20$" puis "Montre-moi toutes les options"
+  Dernier message : "Finalement on sera 60"
+  → {"type_produit":"tshirt","quantite":60,"budget_par_unite":20,"show_all_options":false}
+
+- Aucune conversation précédente
+  Dernier message : "Montre-moi toutes les options"
   → {"type_produit":"autre","quantite":25,"budget_par_unite":100,"show_all_options":true}`,
             },
             {
                 role: 'user',
-                content: message,
+                content: `${conversation ? `Conversation précédente :\n${conversation}\n\n` : 'Aucune conversation précédente.\n\n'}Dernier message du client :\n${message}`,
             },
         ],
-        model: 'llama-3.3-70b-versatile',
+        model: CHAT_MODEL,
+        reasoning_effort: 'low',
         temperature: 0.2,
-        max_tokens: 500,
+        max_tokens: 1500,
+        response_format: { type: 'json_object' },
     });
 
     const text = completion.choices[0]?.message?.content || '{}';
     const cleanText = text.replace(/```json\n?/g, '').replace(/```\n?/g, '').trim();
 
     try {
-        return JSON.parse(cleanText);
+        return sanitizeNeeds(JSON.parse(cleanText));
     } catch (e) {
         console.error('Erreur parsing besoins:', text);
-        return {
-            type_produit: 'autre',
-            quantite: 25,
-            budget_par_unite: 100,
-            show_all_options: false,
-        };
+        return sanitizeNeeds({});
     }
+}
+
+// Le JSON vient du LLM : on ne garde que des valeurs du bon type, dans des bornes
+// raisonnables, avant qu'elles servent dans la requête SQL et les calculs de budget.
+function sanitizeNeeds(raw: any): ParsedNeeds {
+    const positiveInt = (value: unknown, max: number): number | undefined => {
+        const n = Math.round(Number(value));
+        return Number.isFinite(n) && n > 0 && n <= max ? n : undefined;
+    };
+    const positiveNumber = (value: unknown, max: number): number | undefined => {
+        const n = Number(value);
+        return Number.isFinite(n) && n > 0 && n <= max ? n : undefined;
+    };
+    const text = (value: unknown): string | undefined =>
+        typeof value === 'string' && value.trim() ? value.trim().slice(0, 200) : undefined;
+
+    return {
+        type_produit: text(raw?.type_produit) ?? 'autre',
+        quantite: positiveInt(raw?.quantite, 100000) ?? DEFAULT_QUANTITY,
+        budget_par_unite: positiveNumber(raw?.budget_par_unite, 100000) ?? DEFAULT_BUDGET,
+        deadline_jours: positiveInt(raw?.deadline_jours, 3650),
+        sport_ou_activite: text(raw?.sport_ou_activite),
+        autres_besoins: text(raw?.autres_besoins),
+        show_all_options: raw?.show_all_options === true,
+    };
 }
 
 // Fonction 2 : Chercher les produits avec RAG vectoriel (pgvector)
@@ -183,16 +262,18 @@ async function findMatchingProducts(needs: ParsedNeeds, originalMessage: string)
     const queryEmbedding = await generateEmbedding(searchQuery);
     const embeddingVector = JSON.stringify(queryEmbedding);
 
+    // Toutes les valeurs passent en paramètres liés : elles viennent du LLM,
+    // donc indirectement de l'utilisateur, et ne doivent jamais être concaténées au SQL.
     const deadlineCondition = deadline_jours
-        ? `AND "leadTime" <= ${deadline_jours}`
-        : '';
+        ? Prisma.sql`AND "leadTime" <= ${deadline_jours}`
+        : Prisma.empty;
 
-    const products = await prisma.$queryRawUnsafe(`
+    const products = await prisma.$queryRaw<any[]>`
         SELECT
             id, name, type, price, "minQty", "maxQty", "leadTime",
             description, tags, customization, sizes, colors,
             "stockQuebec", "stockMontreal",
-            1 - (embedding <=> '${embeddingVector}'::vector) as similarity
+            1 - (embedding <=> ${embeddingVector}::vector) as similarity
         FROM "Product"
         WHERE
             "minQty" <= ${quantite}
@@ -201,7 +282,7 @@ async function findMatchingProducts(needs: ParsedNeeds, originalMessage: string)
           AND embedding IS NOT NULL
         ORDER BY similarity DESC
             LIMIT 20
-    `) as any[];
+    `;
 
     if (products.length === 0) {
         const fallbackProducts = await prisma.product.findMany({
@@ -288,14 +369,18 @@ async function generateRecommendation(
     originalMessage: string,
     needs: ParsedNeeds,
     products: any[],
-    budgetInfo: BudgetInfo
+    budgetInfo: BudgetInfo,
+    history: HistoryMessage[],
+    userConversation: string
 ): Promise<string> {
 
-    const hasQuantity = originalMessage.match(/\d+\s*(personnes?|unités?|équipes?|gens|individus?)/i);
-    const hasBudget = originalMessage.match(/\d+\s*(\$|dollars?|euros?|budget|prix)/i);
+    // On cherche dans tous les messages du client : un budget donné au premier message
+    // ne doit pas être redemandé au troisième.
+    const hasQuantity = userConversation.match(/\d+\s*(personnes?|unités?|équipes?|gens|individus?)/i);
+    const hasBudget = userConversation.match(/\d+\s*(\$|dollars?|euros?|budget|prix)/i);
 
-    const isDefaultQuantity = needs.quantite === 25 && !hasQuantity;
-    const isDefaultBudget = needs.budget_par_unite === 100 && !hasBudget;
+    const isDefaultQuantity = needs.quantite === DEFAULT_QUANTITY && !hasQuantity;
+    const isDefaultBudget = needs.budget_par_unite === DEFAULT_BUDGET && !hasBudget;
 
     const missingInfo = [];
     if (isDefaultQuantity) missingInfo.push('le nombre de personnes');
@@ -404,8 +489,10 @@ ${budgetInfo.hasMoreOptions ? '4. 💰 Mention NATURELLE des autres options NON 
 ${budgetInfo.hasMoreOptions ? '5. Question ouverte pour savoir s\'ils veulent les voir' : '4. Prochaine étape'}
 `}
 
-Reste NATUREL, FRIENDLY et BREF.`,
+Reste NATUREL, FRIENDLY et BREF.
+Tiens compte de la conversation précédente : ne répète pas une question déjà posée et ne redemande pas une information déjà donnée.`,
             },
+            ...history,
             {
                 role: 'user',
                 content: `Message du client : "${originalMessage}"
@@ -436,9 +523,10 @@ ${budgetInfo.hasMoreOptions ? `⚠️ IMPORTANT :
 Génère une recommandation ${missingInfo.length > 0 ? 'avec questions amicales' : 'personnalisée et précise'}.`,
             },
         ],
-        model: 'llama-3.3-70b-versatile',
+        model: CHAT_MODEL,
+        reasoning_effort: 'low',
         temperature: 0.7,
-        max_tokens: 500,
+        max_tokens: 1500,
     });
 
     return completion.choices[0]?.message?.content || 'Désolé, une erreur est survenue.';
