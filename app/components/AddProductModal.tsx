@@ -2,6 +2,8 @@
 
 import { useState } from 'react';
 
+const ADMIN_KEY_STORAGE = 'chatbot-admin-key';
+
 export default function AddProductModal({
                                             isOpen,
                                             onClose,
@@ -13,6 +15,16 @@ export default function AddProductModal({
 }) {
     const [loading, setLoading] = useState(false);
     const [error, setError] = useState('');
+
+    // Clé admin gardée pour la durée de l'onglet seulement (sessionStorage), pour ne pas
+    // la retaper à chaque produit sans la laisser traîner dans le navigateur
+    const [adminKey, setAdminKey] = useState(() => {
+        try {
+            return typeof window !== 'undefined' ? sessionStorage.getItem(ADMIN_KEY_STORAGE) ?? '' : '';
+        } catch {
+            return '';
+        }
+    });
 
     const [formData, setFormData] = useState({
         name: '',
@@ -54,13 +66,17 @@ export default function AddProductModal({
 
             const response = await fetch('/api/products/create', {
                 method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
+                headers: { 'Content-Type': 'application/json', 'x-admin-key': adminKey },
                 body: JSON.stringify(productData),
             });
 
             const data = await response.json();
 
-            if (data.success) {
+            if (response.status === 401) {
+                try { sessionStorage.removeItem(ADMIN_KEY_STORAGE); } catch {}
+                setError('Clé admin invalide');
+            } else if (data.success) {
+                try { sessionStorage.setItem(ADMIN_KEY_STORAGE, adminKey); } catch {}
                 alert(`✅ ${data.message}`);
                 onSuccess();
                 onClose();
@@ -158,6 +174,28 @@ export default function AddProductModal({
                             ❌ {error}
                         </div>
                     )}
+
+                    {/* Clé admin */}
+                    <div style={{ marginBottom: '16px' }}>
+                        <label style={{ ...labelStyle, display: 'block', marginBottom: '8px' }}>
+                            🔒 Clé admin *
+                        </label>
+                        <input
+                            type="password"
+                            value={adminKey}
+                            onChange={(e) => setAdminKey(e.target.value)}
+                            placeholder="Clé fournie par l'administrateur"
+                            autoComplete="off"
+                            required
+                            style={{
+                                ...inputStyle,
+                                width: '100%',
+                                padding: '12px',
+                                borderRadius: '8px',
+                                fontSize: '14px'
+                            }}
+                        />
+                    </div>
 
                     {/* Nom du produit */}
                     <div style={{ marginBottom: '16px' }}>
